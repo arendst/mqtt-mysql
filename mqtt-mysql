@@ -1,0 +1,227 @@
+#!/usr/bin/python
+#
+# mqtt-mysql by Theo Arends
+#
+# Provides MQTT MySql service
+#
+# Execute: mqtt-mysql &
+#
+# Needs paho.mqtt.client
+#   - git clone http://git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.python.git
+#   - python setup.py install
+# Needs python MySql support
+#   - apt-get install python-mysqldb
+#
+# <own_prefix>/select
+#   return all logged topics as JSON data
+# <own_prefix>/select/<topic>[%] [<minutes ago>|latest]
+#   return logged topic data as JSON
+# <own_prefix>/setting/unique [0|1]
+#   set or return a setting
+#
+# **** Start of user configuration values
+
+broker = "localhost"       # MQTT broker ip address or name
+broker_port = 1883         # MQTT broker port
+
+own_prefix = "mysql"       # Own subscribe and publish topic
+
+db_hostname = "localhost"  # MySQL host ip address or name
+db_database = "mqtt"       # MySQL database name
+db_username = "mqttuser"   # MySQL database user name
+db_password = "mqttpass"   # MySQL database password
+
+# **** End of user configuration values
+
+M_VERSION = "1.0"
+
+M_INFO = 0                 # Print messages: 0 - none, 1 - Startup, 2 - Serial, 3 - All
+F_UNIQUE = 0               # 1 = Output no topic name if only one topic type is found
+
+import paho.mqtt.client as mqtt
+import MySQLdb as mdb
+import time
+import datetime
+
+S_UNIQUE = F_UNIQUE
+
+def my_info(type, message):
+  if M_INFO > type:
+    print(message)
+
+def log_message(msg):
+  with con:
+    cur = con.cursor()
+    cur.execute("INSERT INTO topic (topic) SELECT %s FROM DUAL WHERE NOT EXISTS (SELECT topic FROM topic WHERE topic = %s)", (msg.topic, msg.topic))
+    cur.execute("INSERT INTO message (message) SELECT %s FROM DUAL WHERE NOT EXISTS (SELECT message FROM message WHERE message = %s)", (msg.payload, msg.payload))
+    cur.execute("SELECT top_id, mes_id FROM topic,message WHERE topic = %s AND message = %s", (msg.topic, msg.payload))
+    row = cur.fetchone()
+    cur.execute("INSERT INTO messages (topic_id , qos, message_id) VALUES (%s, %s, %s)", (row[0], msg.qos, row[1]))
+    my_info(2, "MySQL INSERT INTO messages (topic_id , qos, message_id) VALUES ("+str(row[0])+", "+str(msg.qos)+", "+str(row[1])+")")
+
+def get_setting(setting, default):
+  state = default
+  with con:
+    cur = con.cursor()
+    cur.execute("SELECT state FROM settings WHERE setting = %s", (setting))
+    if cur.rowcount == 1:
+      row = cur.fetchone()
+      state = row[0]
+    else:
+      cur.execute("INSERT INTO settings (setting, state) VALUES (%s, %s)", (setting, default))
+  return int(state)
+
+def update_setting(setting, state):
+  with con:
+    cur = con.cursor()
+    cur.execute("UPDATE settings SET state = %s WHERE setting = %s", (state, setting))
+  return int(state)
+
+# The callback for when the client receives a CONNACK response from the server.
+def on_connect(client, userdata, flags, rc):
+  my_info(0, "\nMQTT-MySql service connected with result code "+str(rc))
+
+# Subscribing in on_connect() means that if we lose the connection and
+# reconnect then subscriptions will be renewed.
+  client.subscribe([("#",0),("/#",0),("$SYS/broker/log/#",0)])
+
+# The callback for when a PUBLISH message is received from the server.
+def on_message(client, userdata, msg):
+  global S_UNIQUE
+
+  my_info(2, "MQTT subscribed |"+msg.topic+"|"+str(msg.qos)+"|"+str(msg.payload)+"|")
+  part = msg.topic.split("/",2)  # mysql/select/%
+  if part[0] == own_prefix:
+    if len(part) > 1 and part[1] != "result":
+      feedback = 1
+
+      if part[1] == "version":
+        mytopic = "version"
+        payload = M_VERSION
+
+      elif part[1] == "select":
+        if len(part) > 2:
+          topic = part[2]
+          with con:
+            cur = con.cursor()
+            unique = 1
+            try:
+              history = int(msg.payload) * 60
+              timestamp = datetime.datetime.fromtimestamp(time.time()-history).strftime('%Y-%m-%d %H:%M:%S')
+              cur.execute("SELECT DISTINCT topic FROM topic, messages \
+                WHERE topic LIKE %s AND topic_id = top_id AND timestamp > %s", (topic+"%", timestamp))
+              unique = cur.rowcount
+              cur.execute("SELECT timestamp, topic, message FROM topic, messages, message \
+                WHERE topic LIKE %s AND topic_id = top_id AND message_id = mes_id AND timestamp > %s \
+                ORDER BY timestamp ASC LIMIT 1000", (topic+"%", timestamp))
+            except:
+              cur.execute("SELECT timestamp, topic, message FROM topic, messages, message \
+                WHERE topic LIKE %s AND topic_id = top_id AND message_id = mes_id \
+                ORDER BY timestamp DESC LIMIT 1", (topic+"%"))
+              pass
+            if cur.rowcount > 0:
+              rows = cur.fetchall()
+              payload = "["
+              jsonnext = ""
+              for row in rows:
+                payload = payload + jsonnext + '{"time":"' + str(row[0]) +'"'
+                if unique == 1 and S_UNIQUE != 0:
+                  topic = str(row[1])
+                else:
+                  payload = payload + ',"topic":"' + str(row[1]) + '"'
+                payload = payload + ',"value":"' + str(row[2]) + '"}'
+                jsonnext = ","
+              payload = payload + "]"
+            else:
+              payload = "none"
+          mytopic = topic
+        else:      
+          with con:
+            cur = con.cursor()
+            cur.execute("SELECT topic FROM topic ORDER BY topic ASC LIMIT 1000")
+            if cur.rowcount > 0:
+              rows = cur.fetchall()
+              payload = "["
+              jsonnext = ""
+              for row in rows:
+                payload = payload + jsonnext + '{"topic":"' + str(row[0]) + '"}'
+                jsonnext = ","
+              payload = payload + "]"
+            else:
+              payload = "none"
+          mytopic = "topics"
+          
+      elif part[1] == "setting":
+        feedback = 0
+        if len(part) > 2:
+          mytopic = part[2]
+          myset = mytopic.split("/",2)
+
+          if len(msg.payload) > 0:  # Set
+            state = "0"
+            if str(msg.payload)[0] != "0":
+              state = "1"
+            if myset[0] == "unique":
+              S_UNIQUE = update_setting(myset[0], state)
+
+          else:     # Get
+            if myset[0] == "unique":
+              payload = str(get_setting(myset[0], F_UNIQUE))
+              feedback = 1
+
+      else:
+        feedback = 0
+      
+      if feedback == 1:
+        mytopic = own_prefix + "/result/" + mytopic
+        myquote = '"'
+        if payload[0] == "[":
+          myquote = ""
+        payload = '{"result":' + myquote + payload + myquote +'}'
+        my_info(2, "MQTT  published |"+mytopic+"|"+payload+"|")
+        client.publish(mytopic, payload)
+
+  else: 
+    log_message(msg)
+
+my_info(0, "MQTT mysql service.")
+
+mainloop = 1
+while mainloop == 1:
+  client = mqtt.Client()
+  client.on_connect = on_connect
+  client.on_message = on_message
+
+  dc = 1
+  while dc == 1:
+    try:
+      con = mdb.connect(db_hostname, db_username, db_password, db_database)
+      dc = 0
+    except:
+      my_info(0, "Warning: No database (connection) found. Retry in one minute.")
+      time.sleep(60)
+      pass
+
+  S_UNIQUE = get_setting("unique", F_UNIQUE)
+
+  rc = 1
+  while rc == 1:
+    try:
+      client.connect(broker, broker_port)
+      rc = 0
+    except:
+      my_info(0, "Warning: No broker found. Retry in one minute.")
+      time.sleep(60)
+      pass
+
+  while rc == 0:
+    try:
+      rc = client.loop()
+    except:
+      rc = 1
+      pass
+
+  print("Warning: Connection error - Restarting.")
+
+  if M_INFO > 0:
+    mainloop = 0
