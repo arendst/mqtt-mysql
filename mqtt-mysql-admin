@@ -1,0 +1,31 @@
+#!/usr/bin/php
+<?php
+/************************************************************************
+mqtt-mysql-admin
+  - deletes old events from database
+
+Copyright © 2015 Theo Arends
+************************************************************************/
+
+$keepdays = 40;				// Number of days from today to keep events
+
+// ==== MQTT MySQL parameters
+$db_hostname = "sidnas2";		// MQTT MySQL server;
+$db_database = "mqtt";
+$db_username = "mqttuser";
+$db_password = "mqttpass";
+
+$db = mysql_pconnect($db_hostname, $db_username, $db_password) or trigger_error(mysql_error(),E_USER_ERROR);
+mysql_select_db($db_database, $db);
+
+$timestamp = date("Y-m-d", time() - ($keepdays * 86400));
+
+//echo "Timestamp $timestamp \n";
+
+$query = "DELETE FROM messages WHERE timestamp < '$timestamp'";
+$result = mysql_query($query) or die(mysql_error());
+$query = "OPTIMIZE TABLE messages";
+$result = mysql_query($query) or die(mysql_error());
+
+mysql_close($db);
+?>

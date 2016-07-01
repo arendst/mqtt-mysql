@@ -12,11 +12,11 @@
 # Needs python MySql support
 #   - apt-get install python-mysqldb
 #
-# <own_prefix>/select
+# <sub_prefix>/select
 #   return all logged topics as JSON data
-# <own_prefix>/select/<topic>[%] [<minutes ago>|latest]
+# <sub_prefix>/select/<topic>[%] [<minutes ago>|latest]
 #   return logged topic data as JSON
-# <own_prefix>/setting/unique [0|1]
+# <sub_prefix>/setting/unique [0|1]
 #   set or return a setting
 #
 # **** Start of user configuration values
@@ -24,7 +24,8 @@
 broker = "localhost"       # MQTT broker ip address or name
 broker_port = 1883         # MQTT broker port
 
-own_prefix = "mysql"       # Own subscribe and publish topic
+sub_prefix = "mysql"       # Own subscribe topic
+pub_prefix = "stat"        # General publish topic
 
 db_hostname = "localhost"  # MySQL host ip address or name
 db_database = "mqtt"       # MySQL database name
@@ -33,7 +34,7 @@ db_password = "mqttpass"   # MySQL database password
 
 # **** End of user configuration values
 
-M_VERSION = "1.0"
+M_VERSION = "1.1"
 
 M_INFO = 0                 # Print messages: 0 - none, 1 - Startup, 2 - Serial, 3 - All
 F_UNIQUE = 0               # 1 = Output no topic name if only one topic type is found
@@ -52,12 +53,8 @@ def my_info(type, message):
 def log_message(msg):
   with con:
     cur = con.cursor()
-    cur.execute("INSERT INTO topic (topic) SELECT %s FROM DUAL WHERE NOT EXISTS (SELECT topic FROM topic WHERE topic = %s)", (msg.topic, msg.topic))
-    cur.execute("INSERT INTO message (message) SELECT %s FROM DUAL WHERE NOT EXISTS (SELECT message FROM message WHERE message = %s)", (msg.payload, msg.payload))
-    cur.execute("SELECT top_id, mes_id FROM topic,message WHERE topic = %s AND message = %s", (msg.topic, msg.payload))
-    row = cur.fetchone()
-    cur.execute("INSERT INTO messages (topic_id , qos, message_id) VALUES (%s, %s, %s)", (row[0], msg.qos, row[1]))
-    my_info(2, "MySQL INSERT INTO messages (topic_id , qos, message_id) VALUES ("+str(row[0])+", "+str(msg.qos)+", "+str(row[1])+")")
+    cur.execute("INSERT INTO messages (topic , qos, message) VALUES (%s, %s, %s)", (msg.topic, msg.qos, msg.payload))
+    my_info(2, "MySQL INSERT INTO messages (topic_id , qos, message_id) VALUES ("+str(msg.topic)+", "+str(msg.qos)+", "+str(msg.payload)+")")
 
 def get_setting(setting, default):
   state = default
@@ -91,7 +88,7 @@ def on_message(client, userdata, msg):
 
   my_info(2, "MQTT subscribed |"+msg.topic+"|"+str(msg.qos)+"|"+str(msg.payload)+"|")
   part = msg.topic.split("/",2)  # mysql/select/%
-  if part[0] == own_prefix:
+  if part[0] == sub_prefix:
     if len(part) > 1 and part[1] != "result":
       feedback = 1
 
@@ -108,16 +105,14 @@ def on_message(client, userdata, msg):
             try:
               history = int(msg.payload) * 60
               timestamp = datetime.datetime.fromtimestamp(time.time()-history).strftime('%Y-%m-%d %H:%M:%S')
-              cur.execute("SELECT DISTINCT topic FROM topic, messages \
-                WHERE topic LIKE %s AND topic_id = top_id AND timestamp > %s", (topic+"%", timestamp))
+              cur.execute("SELECT DISTINCT topic FROM messages \
+                WHERE topic LIKE %s AND timestamp > %s", (topic+"%", timestamp))
               unique = cur.rowcount
-              cur.execute("SELECT timestamp, topic, message FROM topic, messages, message \
-                WHERE topic LIKE %s AND topic_id = top_id AND message_id = mes_id AND timestamp > %s \
-                ORDER BY timestamp ASC LIMIT 1000", (topic+"%", timestamp))
+              cur.execute("SELECT timestamp, topic, message FROM messages \
+                WHERE topic LIKE %s AND timestamp > %s ORDER BY timestamp ASC LIMIT 1000", (topic+"%", timestamp))
             except:
-              cur.execute("SELECT timestamp, topic, message FROM topic, messages, message \
-                WHERE topic LIKE %s AND topic_id = top_id AND message_id = mes_id \
-                ORDER BY timestamp DESC LIMIT 1", (topic+"%"))
+              cur.execute("SELECT timestamp, topic, message FROM messages \
+                WHERE topic LIKE %s ORDER BY timestamp DESC LIMIT 1", (topic+"%"))
               pass
             if cur.rowcount > 0:
               rows = cur.fetchall()
@@ -135,10 +130,10 @@ def on_message(client, userdata, msg):
             else:
               payload = "none"
           mytopic = topic
-        else:      
+        else:
           with con:
             cur = con.cursor()
-            cur.execute("SELECT topic FROM topic ORDER BY topic ASC LIMIT 1000")
+            cur.execute("SELECT DISTINCT topic FROM messages ORDER BY topic ASC LIMIT 1000")
             if cur.rowcount > 0:
               rows = cur.fetchall()
               payload = "["
@@ -150,7 +145,7 @@ def on_message(client, userdata, msg):
             else:
               payload = "none"
           mytopic = "topics"
-          
+
       elif part[1] == "setting":
         feedback = 0
         if len(part) > 2:
@@ -171,9 +166,9 @@ def on_message(client, userdata, msg):
 
       else:
         feedback = 0
-      
+
       if feedback == 1:
-        mytopic = own_prefix + "/result/" + mytopic
+        mytopic = sub_prefix + "/result/" + mytopic
         myquote = '"'
         if payload[0] == "[":
           myquote = ""
@@ -181,7 +176,7 @@ def on_message(client, userdata, msg):
         my_info(2, "MQTT  published |"+mytopic+"|"+payload+"|")
         client.publish(mytopic, payload)
 
-  else: 
+  else:
     log_message(msg)
 
 my_info(0, "MQTT mysql service.")
@@ -214,12 +209,13 @@ while mainloop == 1:
       time.sleep(60)
       pass
 
+  client.publish(pub_prefix+"/MySql/MESSAGE", "Connection with broker established.")
+
   while rc == 0:
     try:
       rc = client.loop()
     except:
       rc = 1
-      pass
 
   print("Warning: Connection error - Restarting.")
 
